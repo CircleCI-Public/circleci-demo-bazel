@@ -1,0 +1,111 @@
+version: 2.1
+setup: true   # this is a setup workflow — it generates the real pipeline config
+
+orbs:
+  continuation: circleci/continuation@1.0.0
+
+# ─── Reusable commands ───────────────────────────────────────────────────────
+
+commands:
+  install-bazel:
+    steps:
+      - run:
+          name: Install Bazel (via Bazelisk)
+          command: |
+            curl -fsSL \
+              https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-amd64 \
+              -o /tmp/bazel
+            sudo mv /tmp/bazel /usr/local/bin/bazel
+            sudo chmod +x /usr/local/bin/bazel
+            bazel version
+
+  install-bazel-diff:
+    steps:
+      - run:
+          name: Install bazel-diff
+          command: |
+            BAZEL_DIFF_VERSION="v49.1.0"
+            curl -fsSL \
+              "https://github.com/Tinder/bazel-diff/releases/download/${BAZEL_DIFF_VERSION}/bazel-diff-rust-linux-amd64" \
+              -o /tmp/bazel-diff
+            sudo mv /tmp/bazel-diff /usr/local/bin/bazel-diff
+            sudo chmod +x /usr/local/bin/bazel-diff
+            bazel-diff --version
+
+# ─── Setup job ───────────────────────────────────────────────────────────────
+
+jobs:
+  setup:
+    docker:
+      - image: cimg/base:current
+    steps:
+      - checkout
+      - install-bazel
+      - install-bazel-diff
+
+      # On main: snapshot the dependency graph so PR jobs can diff against it.
+      - when:
+          condition:
+            equal: [main, << pipeline.git.branch >>]
+          steps:
+            - run:
+                name: Generate graph hashes for main
+                command: |
+                  mkdir -p hashes
+                  bazel-diff generate-hashes \
+                    --workspacePath . \
+                    --bazelPath $(which bazel) \
+                    hashes/main.json
+            - save_cache:
+                key: v1-bazel-diff-main-{{ .Revision }}
+                paths:
+                  - hashes/main.json
+
+      # On PRs: restore the main snapshot and compute the affected target set.
+      - unless:
+          condition:
+            equal: [main, << pipeline.git.branch >>]
+          steps:
+            - restore_cache:
+                keys:
+                  - v1-bazel-diff-main-
+            - run:
+                name: Generate graph hashes for this branch
+                command: |
+                  mkdir -p hashes
+                  bazel-diff generate-hashes \
+                    --workspacePath . \
+                    --bazelPath $(which bazel) \
+                    hashes/current.json
+            - run:
+                name: Compute affected targets
+                command: |
+                  if [ ! -f hashes/main.json ]; then
+                    echo "No base hash found — falling back to full build"
+                    echo "//..." > hashes/affected.txt
+                  else
+                    bazel-diff get-impacted-targets \
+                      --startingHashes hashes/main.json \
+                      --finalHashes hashes/current.json \
+                      --workspacePath . \
+                      --output hashes/affected.txt
+                  fi
+                  echo "--- Affected targets ---"
+                  cat hashes/affected.txt
+
+      # Generate a purpose-built continuation config for the computed target set.
+      # The logic lives in .circleci/generate_config.py to avoid embedding
+      # YAML template strings inside a Python heredoc inside a YAML block scalar.
+      - run:
+          name: Generate continuation config
+          command: python3 .circleci/generate_config.py
+
+      - continuation/continue:
+          configuration_path: /tmp/continuation_config.yml
+
+# ─── Workflow ─────────────────────────────────────────────────────────────────
+
+workflows:
+  setup:
+    jobs:
+      - setup

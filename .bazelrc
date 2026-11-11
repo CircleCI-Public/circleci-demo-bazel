@@ -1,0 +1,5 @@
+# Show test output on failure
+test --test_output=errors
+
+# Use Bzlmod
+common --enable_bzlmod
