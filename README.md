@@ -1,10 +1,10 @@
-# bazel-demo
+# circleci-demo-bazel
 
-A multi-target Bazel project that demonstrates graph-aware incremental CI builds on CircleCI using [bazel-diff](https://github.com/Tinder/bazel-diff) and CircleCI [dynamic config](https://circleci.com/docs/dynamic-config/). A setup workflow computes the affected Bazel targets and generates a purpose-built continuation pipeline — one build job for all affected targets, then parallel test jobs — rather than running conditional skip logic inside a static config.
+A multi-target Bazel project that demonstrates graph-aware incremental CI builds on CircleCI using [bazel-diff](https://github.com/Tinder/bazel-diff) and CircleCI [dynamic config](https://circleci.com/docs/dynamic-config/). A setup workflow computes the affected Bazel targets and generates a purpose-built continuation workflow — one build job for all affected targets, then parallel test jobs — rather than running conditional skip logic inside a static config.
 
 ## The problem
 
-In a large monorepo, running `bazel test //...` on every PR is wasteful. Most changes touch a small slice of the codebase, but CI re-builds and re-tests everything regardless. As the repo grows this becomes the primary bottleneck — build times balloon and developer feedback loops slow down.
+In a large monorepo, running `bazel test //...` on every push is wasteful. Most changes touch a small slice of the codebase, but CI re-builds and re-tests everything regardless. As the repo grows this becomes the primary bottleneck — build times balloon and developer feedback loops slow down.
 
 The naive alternative — only run tests in directories that changed — misses transitive effects. If you change a shared library, every downstream consumer is affected too, even if their own source files didn't change.
 
@@ -15,7 +15,7 @@ Bazel models your codebase as a dependency graph. Every target (`py_library`, `p
 `bazel-diff` exploits this graph to compute a precise affected-target set between two commits:
 
 1. **Snapshot the graph** — for each target, hash its rule definition, all its attributes, and the content of every source file it directly or transitively consumes. The result is a JSON file mapping target → hash.
-2. **Diff two snapshots** — compare the hash file from `main` against the hash file from the PR branch. Any target whose hash changed, or whose transitive dependency's hash changed, is "affected."
+2. **Diff two snapshots** — compare the hash file from `main` against the hash file from your branch. Any target whose hash changed, or whose transitive dependency's hash changed, is "affected."
 3. **Build and test only those targets** — pass the affected set directly to `bazel build` and `bazel test`.
 
 This is more correct than file-path heuristics because it understands the build graph. A change to a `.bzl` macro, a `BUILD` file attribute, or a shared library all propagate through the graph correctly.
@@ -28,14 +28,14 @@ It runs `bazel query` (not `bazel build`) to traverse the dependency graph, then
 
 Comparing two commits requires a hash snapshot at each. Checking out both commits in a single CI job is awkward, so this repo uses a caching strategy instead:
 
-- The **setup workflow** on `main` generates a hash snapshot after every merge and saves it to CircleCI's cache under a key that includes the commit SHA (`v1-bazel-diff-main-<sha>`).
-- The **setup workflow** on PR branches restores the latest `main` snapshot using a prefix cache key (`v1-bazel-diff-main-`), which always resolves to the most recent entry without needing to know the exact commit.
+- The **setup workflow** on `main` generates a hash snapshot after every push to `main` and saves it to CircleCI's cache under a key that includes the commit SHA (`v1-bazel-diff-main-<sha>`).
+- The **setup workflow** on other branches restores the latest `main` snapshot using a prefix cache key (`v1-bazel-diff-main-`), which always resolves to the most recent entry without needing to know the exact commit.
 
 ### Two layers of caching
 
 | Cache | What it stores | Purpose |
 |-------|---------------|---------|
-| `save_cache` / `restore_cache` | bazel-diff hash JSON from `main` | Lets PR setup jobs know what the graph looked like before their changes |
+| `save_cache` / `restore_cache` | bazel-diff hash JSON from `main` | Lets branch setup jobs know what the graph looked like before their changes |
 | `with_tool_cache` (Bazel remote cache) | Compiled build artifacts | Avoids recompiling targets whose inputs haven't changed |
 
 They solve different problems. The hash cache tells the setup workflow *which* targets to include in the continuation. The build artifact cache makes building those targets fast.
@@ -53,7 +53,7 @@ The dependency graph is intentional. A change to `lib/math` affects `app/hello` 
 
 ## How the CI pipeline works
 
-This repo uses CircleCI [dynamic config](https://circleci.com/docs/dynamic-config/). Rather than a static pipeline where every job decides at runtime what to skip, the setup workflow computes the affected target set first and generates a purpose-built continuation pipeline for that specific commit.
+This repo uses CircleCI [dynamic config](https://circleci.com/docs/dynamic-config/). Rather than a static pipeline where every job decides at runtime what to skip, the setup workflow computes the affected target set first and generates a purpose-built continuation workflow for that specific commit.
 
 ```
 Push
@@ -63,7 +63,7 @@ Push
        ├─ [main]  bazel-diff generate-hashes → save to cache
        │          generate continuation: single build-and-test job for //...
        │
-       └─ [PR]    restore main hashes from cache
+       └─ [branch] restore main hashes from cache
                   bazel-diff generate-hashes for this branch
                   bazel-diff get-impacted-targets → affected list
                   filter to rule targets; split into build + test targets
@@ -71,7 +71,7 @@ Push
        │
        └─ continuation API call
             │
-            └─ continuation pipeline (ci workflow)
+            └─ continuation workflow (ci, same pipeline)
                  build-affected                ← builds all affected rule targets
                    ├─ test-lib-math-math-test  ┐ parallel, each requires
                    └─ test-lib-strings-...     ┘ build-affected
@@ -85,7 +85,7 @@ The setup workflow has a single `setup` job that runs on every push. It installs
 1. Runs `bazel-diff generate-hashes` → saves a snapshot of the full Bazel dependency graph to cache (`v1-bazel-diff-main-<sha>`).
 2. Generates a single `build-and-test` continuation job targeting `//...`.
 
-**On a PR branch:**
+**On any other branch:**
 1. Restores the latest `main` snapshot from cache.
 2. Runs `bazel-diff generate-hashes` for the current branch.
 3. Runs `bazel-diff get-impacted-targets` → affected target list.
@@ -93,38 +93,72 @@ The setup workflow has a single `setup` job that runs on every push. It installs
 5. Splits into build targets and test targets (`kind(test, set(...))`).
 6. Generates a continuation config with one `build-affected` job and one `test-<target>` job per test target.
 
-### Continuation pipeline (generated per-commit)
+### Continuation config (generated per-commit)
 
 The continuation is generated by `.circleci/generate_config.py` and varies by branch:
+
+These are excerpts of the real generated config. The `checkout` and Bazel install steps that start every job are omitted; run the generator locally to see the full output.
 
 **`main`** — single job:
 ```yaml
 jobs:
   build-and-test:
+    docker:
+      - image: cimg/base:current
     steps:
-      - bazel build //...
-      - bazel test --build_tests_only //...
+      # checkout and Bazel install steps omitted
+      - with_tool_cache:
+          tool: bazel
+          steps:
+            - run:
+                name: "Build"
+                command: bazel build //...
+            - run:
+                name: "Test"
+                command: bazel test --build_tests_only //...
+
+workflows:
+  ci:
+    jobs:
+      - build-and-test
 ```
 
-**PR branches** — one build job, then parallel test jobs. For a `lib/math` change:
+**Other branches** — one build job, then parallel test jobs. For a `lib/math` change:
 ```yaml
 jobs:
   build-affected:
+    docker:
+      - image: cimg/base:current
     steps:
-      - bazel build //lib/math:math //lib/math:math_test //app/hello:hello
-        # Bazel handles internal dependency ordering; populates remote cache
+      # checkout and Bazel install steps omitted
+      - with_tool_cache:
+          tool: bazel
+          steps:
+            # Bazel handles internal dependency ordering; populates the remote cache
+            - run:
+                name: Build affected targets
+                command: bazel build //app/hello:hello //lib/math:math //lib/math:math_test
 
   test-lib-math-math-test:
+    docker:
+      - image: cimg/base:current
     steps:
-      - bazel test //lib/math:math_test
-        # Artifacts already in remote cache — no recompilation
+      # checkout and Bazel install steps omitted
+      - with_tool_cache:
+          tool: bazel
+          steps:
+            # Artifacts already in the remote cache — no recompilation
+            - run:
+                name: "Test //lib/math:math_test"
+                command: bazel test //lib/math:math_test
 
 workflows:
   ci:
     jobs:
       - build-affected
       - test-lib-math-math-test:
-          requires: [build-affected]   # waits for build, then runs
+          requires:
+            - build-affected   # waits for build, then runs
 ```
 
 `//app/goodbye` is absent entirely — it has no dependency on `lib/math`. `//app/hello` is built (it's affected) but has no tests, so it appears only in `build-affected`. Test jobs run in parallel once the build completes.
@@ -133,21 +167,15 @@ The pipeline itself is the answer to "what ran" — no conditionals, no skip log
 
 ## Demoing the incremental build
 
-### Step 0 — enable dynamic config in project settings
+### Step 1 — push to `main` once first
 
-Dynamic config must be turned on before `setup: true` in `config.yml` takes effect. In the CircleCI web UI: **Project Settings → Advanced → Enable dynamic config using setup workflows**.
-
-Without this, CircleCI treats `config.yml` as a normal pipeline and ignores `setup: true`.
-
-### Step 1 — ensure a green `main` run exists
-
-The PR setup workflow needs a cached hash snapshot from `main` to diff against. Check that the latest `main` run succeeded:
+The branch setup workflow diffs against a cached hash snapshot from `main`. Check that the latest `main` run succeeded:
 
 ```bash
-circleci run list --project gh/<org>/webster-bazel-demo --branch main --limit 1
+circleci run list --project gh/<your-org>/circleci-demo-bazel --branch main --limit 1
 ```
 
-If it failed, push a fix to `main` and wait for the setup + continuation workflows to go green.
+Without a `main` snapshot, branch pipelines fall back to building everything. Push to `main` once first so you can see the incremental behavior.
 
 ### Step 2 — create a branch that only touches `lib/math`
 
@@ -163,7 +191,7 @@ git push -u origin demo/math-only
 
 ```bash
 # Wait ~10s for CircleCI to pick up the push
-circleci run list --project gh/<org>/webster-bazel-demo --branch demo/math-only --limit 1
+circleci run list --project gh/<your-org>/circleci-demo-bazel --branch demo/math-only --limit 1
 
 # Watch setup + continuation live
 circleci run watch <run-id>
@@ -173,31 +201,28 @@ You'll see two workflow phases: `setup` completes first, then `ci` (the continua
 
 ### Step 4 — inspect what the setup workflow computed
 
-List the setup job's steps to find the relevant ones, then read their output:
+Find the setup job, then read the output of the two steps that matter. Step numbers are not sequential; on a branch run, **Compute affected targets** is step 106 and **Generate continuation config** is step 107. If yours differ, `circleci job output list <setup-job-id>` prints every step's full output under headings like `## 106: Compute affected targets`.
 
 ```bash
-# Find the setup job ID
-circleci run get <run-id> --json \
-  | python3 -c "import json,sys; r=json.load(sys.stdin); [print(j['id'], j['name']) for w in r['workflows'] for j in w['jobs']]"
+# Prints a table of every job in the run, with its ID
+circleci run get <run-id>
 
-# List all steps with numbers
-circleci job output list <setup-job-id>
+# Read "Compute affected targets" output (raw bazel-diff list)
+circleci job output get <setup-job-id> --step-num 106 --strip-ansi
 
-# Read "Compute affected targets" output
-circleci job output get <setup-job-id> --step-num <N> --strip-ansi
-
-# Read "Generate continuation config" output to see the full generated YAML
-circleci job output get <setup-job-id> --step-num <N> --strip-ansi
+# Read "Generate continuation config" output (filtered targets + full generated YAML)
+circleci job output get <setup-job-id> --step-num 107 --strip-ansi
 ```
 
-**Expected affected targets (lib/math change):**
+**Expected Compute affected targets output (step 106, lib/math change):**
 ```
 //app/hello:hello
 //lib/math:math
+//lib/math:math.py
 //lib/math:math_test
 ```
 
-`//app/goodbye` and `//lib/strings` are absent — no dependency on `lib/math`. Source file targets like `//lib/math:math.py` are filtered out by the `kind(rule, set(...))` query in `generate_config.py` before the continuation is generated.
+`//app/goodbye` and `//lib/strings` are absent — no dependency on `lib/math`. The raw list still includes the source file target `//lib/math:math.py`; `generate_config.py` filters it out with a `kind(rule, set(...))` query, so the Generate continuation config step (107) lists three targets under "Affected rule targets (3)".
 
 **Expected generated workflow (from the Generate continuation config step):**
 ```yaml
@@ -220,13 +245,17 @@ git commit -m "demo: change lib/strings only"
 git push -u origin demo/strings-only
 ```
 
-Now **both** `app/hello` and `app/goodbye` should appear in `build-affected` (both depend on `lib/strings`), but `lib/math` and `lib/math:math_test` should be absent. `lib/strings:strings_test` will appear as a `test-lib-strings-strings-test` job requiring `build-affected`.
+Now **both** `app/hello` and `app/goodbye` should appear in `build-affected` (both depend on `lib/strings`), but `lib/math` and `lib/math:math_test` should be absent. `//lib/strings:strings_test` will appear as a `test-lib-strings-strings-test` job requiring `build-affected`.
+
+## Troubleshooting
+
+If the `setup` workflow runs but no `ci` workflow follows it, check that **Enable dynamic config using setup workflows** is on in **Project Settings > Advanced**.
 
 ## Tool versions
 
 | Tool | Version | Notes |
 |------|---------|-------|
-| Bazel | latest via Bazelisk | Bazelisk reads `.bazelversion` if present; otherwise uses latest stable |
+| Bazel | 9.3.2 | Pinned in `.bazelversion`; Bazelisk downloads that version |
 | bazel-diff | v49.1.0 | Rust rewrite; ships as a native binary (no JVM required) |
 | rules_python | 2.3.4 | Required for `py_*` rules under Bzlmod (Bazel 7+) |
 
@@ -236,7 +265,8 @@ Now **both** `app/hello` and `app/goodbye` should appear in `build-affected` (bo
 # Install Bazelisk (acts as the `bazel` command)
 brew install bazelisk          # macOS
 # or
-curl -fsSL https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m | sed 's/x86_64/amd64/') -o /usr/local/bin/bazel && chmod +x /usr/local/bin/bazel
+curl -fsSL https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-$(uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/') -o /tmp/bazel \
+  && sudo install -m 0755 /tmp/bazel /usr/local/bin/bazel   # Linux
 
 # Build and test everything
 bazel build //...

@@ -32,6 +32,15 @@ INSTALL_BAZEL_CMD = (
     "            sudo mv /tmp/bazel /usr/local/bin/bazel\n"
     "            sudo chmod +x /usr/local/bin/bazel"
 )
+# Bazel writes JUnit XML to bazel-testlogs/<package>/<target>/test.xml;
+# copy it somewhere store_test_results can read, keeping the package path.
+COLLECT_TEST_RESULTS_CMD = (
+    "mkdir -p /tmp/test-results\n"
+    "            if [ -d bazel-testlogs ]; then\n"
+    "              cd bazel-testlogs\n"
+    "              find -L . -name test.xml -exec cp --parents {} /tmp/test-results \\;\n"
+    "            fi"
+)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -56,6 +65,18 @@ def install_bazel_step() -> str:
         "          name: Install Bazel (via Bazelisk)\n"
         "          command: |\n"
         f"            {INSTALL_BAZEL_CMD}\n"
+    )
+
+
+def store_test_results_steps() -> str:
+    return (
+        "      - run:\n"
+        "          name: Collect test results\n"
+        "          when: always\n"
+        "          command: |\n"
+        f"            {COLLECT_TEST_RESULTS_CMD}\n"
+        "      - store_test_results:\n"
+        "          path: /tmp/test-results\n"
     )
 
 
@@ -92,8 +113,7 @@ def test_job(target: str) -> str:
         f"            - run:\n"
         f"                name: \"Test {target}\"\n"
         f"                command: bazel test {target}\n"
-        f"      - store_test_results:\n"
-        f"          path: /tmp/test-results\n"
+        + store_test_results_steps()
     )
 
 
@@ -115,8 +135,7 @@ def single_build_and_test(targets_expr: str, label: str = "") -> str:
         f"            - run:\n"
         f"                name: \"Test{tag}\"\n"
         f"                command: bazel test --build_tests_only {targets_expr}\n"
-        f"      - store_test_results:\n"
-        f"          path: /tmp/test-results\n"
+        + store_test_results_steps()
     )
 
 
