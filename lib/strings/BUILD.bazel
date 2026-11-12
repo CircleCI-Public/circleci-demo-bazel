@@ -1,0 +1,13 @@
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "strings",
+    srcs = ["strings.py"],
+    visibility = ["//visibility:public"],
+)
+
+py_test(
+    name = "strings_test",
+    srcs = ["strings_test.py"],
+    deps = [":strings"],
+)
